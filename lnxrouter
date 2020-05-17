@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VERSION=0.5.3
+VERSION=0.5.4
 PROGNAME="$(basename $0)"
 
 export LC_ALL=C
@@ -11,6 +11,7 @@ umask $SCRIPT_UMASK
 usage() {
     cat << EOF
 linux-router $VERSION (https://github.com/garywill/linux-router)
+Released under LGPL, with no warranty. Use on your own risk.
 
 Usage: $PROGNAME <options>
 
@@ -25,6 +26,7 @@ Options:
                             (Note using this with default DNS option may leak
                             queries to other interfaces)
     -n                      Do not provide Internet
+    --ban-priv              Disallow clients to access my private network
     
     -g <ip>                 Set this host's IPv4 address, netmask is 24 
     -6                      Enable IPv6 (NAT)
@@ -37,6 +39,8 @@ Options:
                             (Note IPv6 addresses need '[]' around)
     --no-dns                Do not serve DNS
     --no-dnsmasq            Disable dnsmasq server (DHCP, DNS, RA)
+    --catch-dns             Transparent DNS proxy, redirect packets(TCP/UDP) 
+                            whose destination port is 53 to this host
     --log-dns               Show DNS query log
     --dhcp-dns <IP1[,IP2]>|no
                             Set IPv4 DNS offered by DHCP (default: this host)
@@ -53,7 +57,7 @@ Options:
     --mac <MAC>             Set MAC address
  
     --tp <port>             Transparent proxy,
-                            redirect non-LAN tcp and udp traffic to port.
+                            redirect non-LAN TCP and UDP traffic to port.
                             Usually used with '--dns'
     
   Wifi hotspot options:
@@ -113,11 +117,12 @@ GATEWAY=
 PREFIX6=
 IID6=1
 IPV6=0
-ROUTE_ADDRS=
+BANLAN=0
 DHCP_DNS=gateway
 DHCP_DNS6=gateway
 dnsmasq_NO_DNS=0
 NO_DNSMASQ=0
+CATCH_DNS=0
 SHOW_DNS_QUERY=0
 ETC_HOSTS=0
 ADDN_HOSTS=
@@ -186,6 +191,10 @@ while [[ -n "$1" ]]; do
             shift
             SHARE_METHOD=none
             ;;
+        --ban-priv)
+            shift
+            BANLAN=1
+            ;;
         --tp)
             shift
             TP_PORT="$1"
@@ -236,6 +245,10 @@ while [[ -n "$1" ]]; do
             DHCP_DNS6="$1"
             shift
             ;;
+        --catch-dns)
+            shift
+            CATCH_DNS=1
+            ;;    
         --log-dns)
             shift
             SHOW_DNS_QUERY=1
@@ -733,6 +746,72 @@ stop_nat() {
     fi
 }
 
+start_ban_lan() {
+    echo
+    echo "iptables: Disallow clients to access LAN"
+    iptables_ -N BANLAN-f-${SUBNET_IFACE}  || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 0.0.0.0/8 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 10.0.0.0/8 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 100.64.0.0/10 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 127.0.0.0/8 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 169.254.0.0/16 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 172.16.0.0/12 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 192.168.0.0/16 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 224.0.0.0/4 -j REJECT || die
+    iptables_ -v -I BANLAN-f-${SUBNET_IFACE} -d 255.255.255.255 -j REJECT || die
+    
+    iptables_ -I FORWARD -i ${SUBNET_IFACE} -j BANLAN-f-${SUBNET_IFACE} || die
+    
+    iptables_ -N BANLAN-i-${SUBNET_IFACE}
+    #iptables_ -v -I BANLAN-i-${SUBNET_IFACE} -i ${SUBNET_IFACE} -j REJECT || die
+    iptables_ -v -I BANLAN-i-${SUBNET_IFACE} -i ${SUBNET_IFACE} ! -p icmp -j REJECT || die
+    
+    iptables_ -I INPUT -i ${SUBNET_IFACE} -j BANLAN-i-${SUBNET_IFACE} || die
+    
+    if [[ $IPV6 -eq 1 ]]; then
+        ip6tables_ -N BANLAN-f-${SUBNET_IFACE}  || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d fc00::/7 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d fe80::/10 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d ff00::/8 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d ::1 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d ::/128 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d ::ffff:0:0/96 -j REJECT || die
+        ip6tables_ -v -I BANLAN-f-${SUBNET_IFACE} -d ::ffff:0:0:0/96 -j REJECT || die
+
+        ip6tables_ -I FORWARD -i ${SUBNET_IFACE} -j BANLAN-f-${SUBNET_IFACE} || die
+        
+        ip6tables_ -N BANLAN-i-${SUBNET_IFACE}  || die
+        #ip6tables_ -v -I BANLAN-i-${SUBNET_IFACE} -i ${SUBNET_IFACE} -j REJECT || die
+        ip6tables_ -v -I BANLAN-i-${SUBNET_IFACE} -i ${SUBNET_IFACE} ! -p icmpv6 -j REJECT || die
+
+        ip6tables_ -I INPUT -i ${SUBNET_IFACE} -j BANLAN-i-${SUBNET_IFACE} || die
+    fi
+}
+stop_ban_lan() {
+    echo "iptables: Unban clients' LAN access"
+    
+    iptables_ -D FORWARD -i ${SUBNET_IFACE} -j BANLAN-f-${SUBNET_IFACE} 
+    
+    iptables_ -F BANLAN-f-${SUBNET_IFACE}
+    iptables_ -X BANLAN-f-${SUBNET_IFACE}
+    
+    iptables_ -D INPUT -i ${SUBNET_IFACE} -j BANLAN-i-${SUBNET_IFACE}
+    
+    iptables_ -F BANLAN-i-${SUBNET_IFACE}
+    iptables_ -X BANLAN-i-${SUBNET_IFACE}
+    if [[ $IPV6 -eq 1 ]]; then
+        ip6tables_ -D FORWARD -i ${SUBNET_IFACE} -j BANLAN-f-${SUBNET_IFACE} 
+    
+        ip6tables_ -F BANLAN-f-${SUBNET_IFACE}
+        ip6tables_ -X BANLAN-f-${SUBNET_IFACE} 
+        
+        ip6tables_ -D INPUT -i ${SUBNET_IFACE} -j BANLAN-i-${SUBNET_IFACE}
+        
+        ip6tables_ -F BANLAN-i-${SUBNET_IFACE}
+        ip6tables_ -X BANLAN-i-${SUBNET_IFACE} 
+    fi
+}
+
 allow_dns_port() {
     echo
     echo "iptables: allow DNS port access"
@@ -750,6 +829,26 @@ unallow_dns_port() {
     if [[ $IPV6 -eq 1 ]]; then
         ip6tables_ -D INPUT -i ${SUBNET_IFACE} -s ${PREFIX6}/64 -d ${GATEWAY6} -p tcp -m tcp --dport 53 -j ACCEPT
         ip6tables_ -D INPUT -i ${SUBNET_IFACE} -s ${PREFIX6}/64 -d ${GATEWAY6} -p udp -m udp --dport 53 -j ACCEPT
+    fi
+}
+
+start_catch_dns() {
+    echo
+    echo "iptables: redirect all TCP/UDP packet that destination port is 53"
+    iptables_ -v -t nat -I PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY} -p udp -m udp --dport 53 -j REDIRECT --to-ports 53 || die
+    iptables_ -v -t nat -I PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY} -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 53 || die
+    if [[ $IPV6 -eq 1 ]]; then
+        ip6tables_ -v -t nat -I PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY6} -p udp -m udp --dport 53 -j REDIRECT --to-ports 53 || die
+        ip6tables_ -v -t nat -I PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY6} -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 53 || die
+    fi
+}
+stop_catch_dns() {
+    echo "iptables: stop redirecting DNS queries"
+    iptables_ -t nat -D PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY} -p udp -m udp --dport 53 -j REDIRECT --to-ports 53 
+    iptables_ -t nat -D PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY} -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 53 
+    if [[ $IPV6 -eq 1 ]]; then
+        ip6tables_ -t nat -D PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY6} -p udp -m udp --dport 53 -j REDIRECT --to-ports 53 
+        ip6tables_ -t nat -D PREROUTING -i ${SUBNET_IFACE} ! -d ${GATEWAY6} -p tcp -m tcp --dport 53 -j REDIRECT --to-ports 53 
     fi
 }
 
@@ -837,6 +936,7 @@ kill_processes() {
             pid=$(cat $x)
             pn=$( ps -p $pid -o comm= ) 
             #echo "Killing $pid $pn ... "
+            pkill -P $pid
             kill $pid 2>/dev/null && ( echo "Killed $pid $pn" && rm $x ) || echo "Failed to kill $pid $pn, it may have exited"
         fi
     done
@@ -892,10 +992,14 @@ clean_iptables() {
         unallow_dns_port
     fi
     
+    [[ "$CATCH_DNS" -eq 1 ]] && stop_catch_dns
+    
     
     if [[ $NO_DNSMASQ -eq 0 ]]; then
         stop_dhcp
     fi
+    
+    [[ "$BANLAN" -eq 1 ]] && stop_ban_lan
 }
 
 cleanup() {
@@ -911,7 +1015,7 @@ cleanup() {
     kill -15 -$pgid
     sleep 1 
     echo "Cleaning up done"
-    kill -9 -$pgid
+    #kill -9 -$pgid
 }
 
 die() { # SIGUSR2
@@ -1423,9 +1527,14 @@ if [[ $NM_RUNNING -eq 1 ]] && nm_knows $TARGET_IFACE ; then
 fi
 
 if [[ $NO_DNSMASQ -eq 0 ]]; then
+    if grep "^nobody:" /etc/group >/dev/null 2>&1 ; then
+        NOBODY_GROUP="nobody"
+    else
+        NOBODY_GROUP="nogroup"
+    fi
     cat <<- EOF > $CONFDIR/dnsmasq.conf
 		user=nobody
-		group=nobody
+		group=$NOBODY_GROUP
 		bind-dynamic
 		listen-address=${GATEWAY}
 		interface=$SUBNET_IFACE
@@ -1434,11 +1543,11 @@ if [[ $NO_DNSMASQ -eq 0 ]]; then
 		dhcp-range=${GATEWAY%.*}.10,${GATEWAY%.*}.250,255.255.255.0
 		dhcp-option-force=option:router,${GATEWAY}
 		#log-dhcp
-		log-facility=/dev/null
+		log-facility=/dev/stdout
 		bogus-priv
 		domain-needed
 	EOF
-    # 'log-dhcp' show too much logs. Using '-d' in dnsmasq command shows a proper dhcp log
+    # 'log-dhcp'(Extra logging for DHCP) shows too much logs.
     # if use '-d', 'log-facility' should = /dev/null
     if [[ $SHARE_METHOD == "none" ]]; then    
         echo "no-resolv"  >> $CONFDIR/dnsmasq.conf
@@ -1563,12 +1672,16 @@ else
     echo 1 > /proc/sys/net/ipv6/conf/$SUBNET_IFACE/disable_ipv6
 fi
 
+
+
 # enable Internet sharing
 if [[ "$SHARE_METHOD" == "none" ]]; then
     echo "No Internet sharing"
+    [[ "$BANLAN" -eq 1 ]] && start_ban_lan
 elif [[ "$SHARE_METHOD" == "nat" ]]; then
     [[ "$INTERNET_IFACE" && "$dnsmasq_NO_DNS" -eq 0 ]] && echo -e "\nWARN: You specified Internet interface but this host is providing local DNS, queries may leak to other interfaces!!!\n" >&2
     start_nat
+    [[ "$BANLAN" -eq 1 ]] && start_ban_lan
     echo 1 > /proc/sys/net/ipv4/ip_forward || die "Failed enabling system ipv4 forwarding"
     if [[ $IPV6 -eq 1 ]]; then
         echo 1 > /proc/sys/net/ipv6/conf/all/forwarding || die "Failed enabling system ipv6 forwarding"
@@ -1582,6 +1695,7 @@ elif [[ "$SHARE_METHOD" == "redsocks" ]]; then
     fi
     [[ "$dnsmasq_NO_DNS" -eq 0 && ! $DNS ]] &&  echo -e "\nWARN: You are using transparent proxy but this host is providing local DNS, this may cause privacy leak !!!\n" >&2
 
+    [[ "$BANLAN" -eq 1 ]] && start_ban_lan
     start_redsocks
 fi
 
@@ -1590,6 +1704,8 @@ fi
 if [[ "$DHCP_DNS" == "gateway" || "$DHCP_DNS6" == "gateway" ]]; then
     allow_dns_port
 fi
+
+[[ "$CATCH_DNS" -eq 1 ]] && start_catch_dns
 
 
 if [[ $NO_DNSMASQ -eq 0 ]]; then
@@ -1603,16 +1719,18 @@ if [[ $NO_DNSMASQ -eq 0 ]]; then
 
     echo 
     echo "Starting dnsmasq"
-    # dnsmasq '-x' works only when no '-d' (run in foreground)
-    # Using '-d' dnsmasq will not turn into 'nobody'
-    dnsmasq -d -C $CONFDIR/dnsmasq.conf -x $CONFDIR/dnsmasq.pid -l $CONFDIR/dnsmasq.leases & 
-    DNSMASQ_PID=$!
-    echo "dnsmasq PID: $DNSMASQ_PID"
-    #while [[ ! -f $CONFDIR/dnsmasq.pid ]]; do
-    #    sleep 1
-    #done
+    # Using '-d'(no daemon) dnsmasq will not turn into 'nobody'
+    # '-x' works only when no '-d'
+    dnsmasq  -k -C $CONFDIR/dnsmasq.conf -x $CONFDIR/dnsmasq.pid -l $CONFDIR/dnsmasq.leases & 
+    #####DNSMASQ_PID=$!         # only when with '-d'
+    ######echo "dnsmasq PID: $DNSMASQ_PID"      # only when with '-d'
+    i=0; while [[ ! -f $CONFDIR/dnsmasq.pid ]]; do
+        sleep 1
+        i=$((i + 1))
+        if [[ $i -gt 10 ]]; then die "Couldn't get dnsmasq PID" ; fi
+    done
     echo -n "dnsmasq PID: " ; cat $CONFDIR/dnsmasq.pid
-    #(wait $DNSMASQ_PID ; die "dnsmasq failed") &
+    ######(wait $DNSMASQ_PID ; die "dnsmasq failed") &  # wait can't deal with non-child
     ( while [ -e /proc/$DNSMASQ_PID ]; do sleep 10; done ; die "dnsmasq exited" ) &
     sleep 2
 
